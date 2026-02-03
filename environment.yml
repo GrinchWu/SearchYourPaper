@@ -14,3 +14,7 @@ dependencies:
     - PyQt6
     - requests
     - pyinstaller
+    - pymupdf>=1.23.0
+    - huggingface_hub>=0.20.0
+    - markdown
+    - PyQt6-WebEngine

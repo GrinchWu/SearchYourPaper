@@ -2,27 +2,106 @@ from openai import OpenAI
 from typing import Optional
 import json
 
+# 多模态模型列表
+MULTIMODAL_MODELS = [
+    "gpt-4-vision", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini",
+    "claude-3-opus", "claude-3-sonnet", "claude-3-haiku", "claude-3.5-sonnet", "claude-3-5-sonnet",
+    "gemini-pro-vision", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-2"
+]
+
+def is_multimodal_model(model: str) -> bool:
+    """检查模型是否支持多模态"""
+    model_lower = model.lower()
+    return any(m in model_lower for m in MULTIMODAL_MODELS)
+
 class BaseAgent:
-    """智能体基类"""
+    """智能体基类 - 支持多模态"""
     def __init__(self, client: OpenAI, model: str, name: str, role: str):
         self.client, self.model, self.name, self.role = client, model, name, role
+        self.supports_vision = is_multimodal_model(model)
 
-    def think(self, prompt: str, content: str, history: list = None) -> str:
+    def think(self, prompt: str, content: str, history: list = None, images: list = None, max_retries: int = 3) -> str:
+        """
+        思考方法 - 支持图片输入和自动续写
+        images: [{"url": "data:image/png;base64,xxx"}, ...]
+        max_retries: 输出被截断时最多重试次数
+        """
         messages = [{"role": "system", "content": f"你是{self.name}，{self.role}\n\n{prompt}"}]
         if history:
             messages.extend(history)
-        messages.append({"role": "user", "content": content})
-        response = self.client.chat.completions.create(model=self.model, messages=messages, temperature=0.3)
-        return response.choices[0].message.content
+
+        # 构建用户消息（支持多模态）
+        if images and self.supports_vision:
+            user_content = [{"type": "text", "text": content}]
+            for img in images:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": img["url"], "detail": "high"}
+                })
+            messages.append({"role": "user", "content": user_content})
+        else:
+            messages.append({"role": "user", "content": content})
+
+        full_response = ""
+        for attempt in range(max_retries):
+            response = self.client.chat.completions.create(model=self.model, messages=messages, temperature=0.3)
+            chunk = response.choices[0].message.content or ""
+            full_response += chunk
+
+            # 检查是否被截断（finish_reason 为 length 表示达到 token 限制）
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason != "length":
+                break
+
+            # 被截断了，添加助手回复并请求继续
+            messages.append({"role": "assistant", "content": chunk})
+            messages.append({"role": "user", "content": "请继续，从你上次停止的地方继续输出，不要重复已输出的内容。"})
+
+        return full_response
 
 class MultiAgentSystem:
     """多智能体系统基类"""
     def __init__(self, base_url: str, api_key: str, model: str):
         self.client = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
+        self.supports_vision = is_multimodal_model(model)
 
     def create_agent(self, name: str, role: str) -> BaseAgent:
         return BaseAgent(self.client, self.model, name, role)
+
+# ==================== 视觉分析Agent ====================
+
+VISION_AGENT_PROMPT = """作为视觉分析Agent，你需要分析图片内容并提供专业解读。
+
+对于架构图/流程图：
+1. 识别图中的主要组件和模块
+2. 解释组件之间的关系和数据流向
+3. 总结整体架构设计思路
+
+对于实验结果图/表格：
+1. 识别图表类型（折线图、柱状图、表格等）
+2. 提取关键数据点和趋势
+3. 解读实验结论
+
+对于其他图片：
+1. 描述图片主要内容
+2. 分析其在论文/项目中的作用
+3. 提取关键信息
+
+请用中文输出分析结果，结构清晰。"""
+
+class VisionAnalysisAgent(BaseAgent):
+    """视觉分析智能体"""
+    def __init__(self, client: OpenAI, model: str):
+        super().__init__(client, model, "视觉分析Agent",
+                        "专注于分析架构图、实验结果图、表格等视觉内容的多模态专家")
+
+    def analyze_images(self, images: list, context: str = "") -> str:
+        """分析图片列表"""
+        if not images or not self.supports_vision:
+            return ""
+        content = f"请分析以下图片。\n\n背景信息：{context}" if context else "请分析以下图片。"
+        return self.think(VISION_AGENT_PROMPT, content, images=images)
 
 # ==================== arXiv论文分析多智能体系统 ====================
 
@@ -38,8 +117,10 @@ class ArxivAnalysisSystem(MultiAgentSystem):
         self.judger = self.create_agent("审稿人Agent", "一位严格的学术审稿人，负责批判性分析论文的优势、劣势和学术规范性")
         self.experiment = self.create_agent("实验分析Agent", "专注于分析实验设计、数据集、实验结果和资源消耗的实验专家")
         self.method = self.create_agent("方法理解Agent", "专注于理解和解释论文核心方法、技术原理的方法论专家")
+        # 视觉分析Agent（仅多模态模型启用）
+        self.vision = VisionAnalysisAgent(self.client, self.model) if self.supports_vision else None
 
-    def analyze(self, paper_content: str, progress_callback=None) -> str:
+    def analyze(self, paper_content: str, progress_callback=None, images: list = None) -> str:
         results = {}
 
         # 阶段1: 大脑Agent规划任务
@@ -55,6 +136,11 @@ class ArxivAnalysisSystem(MultiAgentSystem):
 
         if progress_callback: progress_callback("审稿人Agent正在进行批判性评审...")
         results['review'] = self.judger.think(JUDGER_AGENT_PROMPT, paper_content)
+
+        # 视觉分析（如果有图片且支持多模态）
+        if images and self.vision:
+            if progress_callback: progress_callback("视觉分析Agent正在分析论文图片...")
+            results['vision'] = self.vision.analyze_images(images, paper_content[:2000])
 
         # 阶段3: 大脑Agent汇总并质量控制
         if progress_callback: progress_callback("大脑Agent正在汇总分析结果...")
@@ -73,6 +159,9 @@ class ArxivAnalysisSystem(MultiAgentSystem):
 【审稿人Agent评审】
 {results['review']}
 """
+        if 'vision' in results:
+            summary_content += f"\n【视觉分析Agent】\n{results['vision']}\n"
+
         final_result = self.brain.think(BRAIN_SUMMARY_PROMPT, summary_content)
 
         # 阶段4: 反思与改进（如果需要）
@@ -99,8 +188,10 @@ class GithubAnalysisSystem(MultiAgentSystem):
         self.architect = self.create_agent("架构分析Agent", "专注于分析项目架构、技术栈、模块设计的架构师")
         self.code_analyst = self.create_agent("代码分析Agent", "专注于分析核心代码实现、算法逻辑、代码质量的代码专家")
         self.usage = self.create_agent("使用分析Agent", "专注于分析项目使用方法、API接口、部署方式的应用专家")
+        # 视觉分析Agent（仅多模态模型启用）
+        self.vision = VisionAnalysisAgent(self.client, self.model) if self.supports_vision else None
 
-    def analyze(self, project_content: str, progress_callback=None) -> str:
+    def analyze(self, project_content: str, progress_callback=None, images: list = None) -> str:
         results = {}
 
         # 阶段1: 大脑Agent规划
@@ -116,6 +207,11 @@ class GithubAnalysisSystem(MultiAgentSystem):
 
         if progress_callback: progress_callback("使用分析Agent正在分析使用方法...")
         results['usage'] = self.usage.think(USAGE_AGENT_PROMPT, project_content)
+
+        # 视觉分析（如果有图片且支持多模态）
+        if images and self.vision:
+            if progress_callback: progress_callback("视觉分析Agent正在分析图片...")
+            results['vision'] = self.vision.analyze_images(images, project_content[:2000])
 
         # 阶段3: 大脑Agent汇总
         if progress_callback: progress_callback("大脑Agent正在汇总分析结果...")
@@ -134,6 +230,9 @@ class GithubAnalysisSystem(MultiAgentSystem):
 【使用分析Agent】
 {results['usage']}
 """
+        if 'vision' in results:
+            summary_content += f"\n【视觉分析Agent】\n{results['vision']}\n"
+
         final_result = self.brain.think(GITHUB_BRAIN_SUMMARY_PROMPT, summary_content)
 
         # 阶段4: 质量检查
